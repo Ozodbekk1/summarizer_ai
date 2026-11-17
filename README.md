@@ -1,16 +1,18 @@
-### Summarizer AI
+# Summarizer AI API
 
-A lightweight FastAPI-based summarization service powered by a T5-small model in GGUF format. This project provides both a web API and a standalone script for text summarization with support for custom instructions and token constraints.
+A robust FastAPI-based summarization service specializing in local inference with GGUF models. Optimized for T5 architecture and CPU execution.
 
-#### Features
+## 🚀 Features
 
-- **FastAPI Web Service**: High-performance API for summarization.
-- **T5 GGUF Model**: Efficient inference using `llama-cpp-python` for encoder-decoder architecture.
-- **Security**: Mandatory `X-Secret-Key` header for API protection.
-- **Customizable**: Control `min_tokens`, `max_tokens`, and provide custom `instructions` for each summary.
-- **Validation**: Built-in token limit checks to ensure model stability.
+- **T5 Architecture Support**: Correct manual encoder-decoder inference implementation for `llama.cpp`.
+- **State Isolation**: Automatic context management ensures fresh state for every request, fixing common inference errors in T5.
+- **Async API**: Non-blocking inference execution using FastAPI and `starlette.concurrency`.
+- **Security**: Environment-based API Secret Key authentication (`X-API-Key` header).
+- **Validation**: Strict Pydantic validation for all requests and token limits.
+- **Detailed Metrics**: Accurate tracking of input/output tokens and processing time.
+- **Thread-Safe**: Safely handles concurrent requests.
 
-#### Installation
+## 🛠 Installation
 
 1. **Clone the repository**:
    ```bash
@@ -29,55 +31,86 @@ A lightweight FastAPI-based summarization service powered by a T5-small model in
    pip install -r requirements.txt
    ```
 
-#### Configuration
+## ⚙️ Configuration
 
-Create a `.env` file in the root directory (based on `.env.example`):
+Create a `.env` file based on `.env.example`:
 ```bash
-API_SECRET_KEY=your_custom_secret_key
+API_SECRET_KEY=your_secure_key_here
+MODEL_PATH=summarizer_ai_model.gguf
+API_PORT=8000
+API_HOST=0.0.0.0
 ```
 
-#### Usage
+## 🖥 Usage
 
-##### Running the API
-
-Start the FastAPI server:
+### Starting the API
 ```bash
-python3 api.py
-```
-The server will be available at `http://0.0.0.0:8000`.
-
-##### API Endpoints
-
-- **POST `/summarize`**
-  - **Headers**:
-    - `x-secret-key`: Your secret key (default: `my_super_secret_key`)
-    - `Content-Type`: `application/json`
-  - **Body**:
-    ```json
-    {
-      "text": "Your long text to summarize...",
-      "min_tokens": 20,
-      "max_tokens": 128,
-      "instructions": "Focus on technical details."
-    }
-    ```
-
-- **GET `/health`**
-  - Returns the health status of the service.
-
-##### Standalone Script
-
-You can also run summarization directly via the CLI:
-```bash
-python3 summarize.py
+python3 main.py
 ```
 
-#### Development
+### API Endpoints
 
-- `api.py`: The FastAPI application and summarization logic.
-- `summarize.py`: A standalone script for quick testing.
-- `summarizer_ai_model.gguf`: The T5-small model weights.
+- **GET `/health`**: Check service and model status.
+- **POST `/summarize`**: Main summarization endpoint.
 
-#### License
+#### Request Body:
+```json
+{
+  "text": "Your input text here",
+  "instructions": "Summarize this in exactly 3 bullet points",
+  "min_tokens": 10,
+  "max_tokens": 128,
+  "temperature": 0.0
+}
+```
 
-MIT
+#### Response Body:
+```json
+{
+  "summary": "The generated summary...",
+  "input_tokens": 45,
+  "output_tokens": 30,
+  "total_tokens": 75,
+  "processing_time_ms": 150
+}
+```
+
+## 🧪 Testing
+
+Run the comprehensive test suite:
+```bash
+python3 tests/test_api.py
+```
+
+## ⚠️ Model Limitations & Alternatives
+
+The current model `summarizer_ai_model.gguf` is a **T5-small (61M parameters)** architecture. 
+
+**Limitations:**
+- **Instruction Following**: Due to its small size and traditional T5 training (focused on the `summarize: ` prefix), it has very limited natural language instruction-following capabilities. It primarily performs extractive/abstractive summarization in a fixed style.
+- **Multilingual Support**: While it can process various inputs, its output quality for languages like Uzbek or cross-lingual tasks (Uzbek to English) may be limited compared to larger models.
+
+**Recommended Alternatives (GGUF):**
+If your use case requires strict instruction following (e.g., "exactly 3 bullet points") or better multilingual support, consider replacing the model with:
+- **Flan-T5-Base/Large**: Better instruction following while keeping the T5 architecture.
+- **Phi-3-mini-4k-instruct (GGUF)**: Excellent instruction following for its size (3.8B).
+- **Qwen2-1.5B-Instruct (GGUF)**: Very capable small model with great multilingual support.
+
+## 📬 Postman Examples
+
+1. **Health Check**:
+   - Method: `GET`
+   - URL: `{{base_url}}/health`
+
+2. **Summarize Text**:
+   - Method: `POST`
+   - URL: `{{base_url}}/summarize`
+   - Headers: `X-API-Key: {{secret_key}}`
+   - Body (JSON):
+     ```json
+     {
+       "text": "The Artificial Intelligence (AI) field has seen significant advancements in recent years...",
+       "instructions": "One sentence summary",
+       "max_tokens": 64
+     }
+     ```

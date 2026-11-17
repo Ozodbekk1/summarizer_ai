@@ -1,143 +1,133 @@
-from fastapi import FastAPI, HTTPException, Header, Depends, Body
-from pydantic import BaseModel
-import llama_cpp
-import ctypes
-import numpy as np
 import os
+import logging
+import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
-app = FastAPI(title="Summarizer AI API")
+from fastapi import FastAPI, HTTPException, Header, Depends, status
+from pydantic import BaseModel, Field, validator
+from starlette.concurrency import run_in_threadpool
+
+from summarize import Summarizer
 
 # Configuration
-MODEL_PATH = "summarizer_ai_model.gguf"
-SECRET_KEY = os.getenv("API_SECRET_KEY", "my_super_secret_key")
-MAX_INPUT_TOKENS = 400  # Leave some room for the model's 512 context
+MODEL_PATH = os.getenv("MODEL_PATH", "summarizer_ai_model.gguf")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "my_super_secret_key")
+MAX_CONTEXT_LENGTH = 512
 
-class Summarizer:
-    def __init__(self, model_path):
-        print(f"Loading model: {model_path}...")
-        self.llm = llama_cpp.Llama(model_path=model_path, n_ctx=512, verbose=False, embedding=True)
-        self.eos_id = self.llm.token_eos()
-        self.pad_id = 0  # T5 pad token is typically 0
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("summarizer-api")
 
-    def get_token_count(self, text: str) -> int:
-        tokens = self.llm.tokenize(text.encode('utf-8'), add_bos=False)
-        return len(tokens)
+# Global summarizer instance
+summarizer: Optional[Summarizer] = None
 
-    def summarize(self, text: str, min_tokens: int = 20, max_tokens: int = 128, instructions: Optional[str] = None):
-        # Clear KV cache to avoid state carry-over
-        mem = llama_cpp.llama_get_memory(self.llm.ctx)
-        if mem:
-            llama_cpp.llama_memory_clear(mem, True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global summarizer
+    try:
+        logger.info(f"Initializing model from {MODEL_PATH}...")
+        summarizer = Summarizer(MODEL_PATH, n_ctx=MAX_CONTEXT_LENGTH)
+        logger.info("Model loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        # We don't raise here to allow the app to start and show health errors, 
+        # but in production, you might want to crash.
+    yield
+    logger.info("Shutting down...")
+    # Clean up resources if needed
 
-        # Build prompt with optional instructions
-        prompt = "summarize: "
-        if instructions:
-            prompt += instructions.strip() + " "
-        prompt += text
-            
-        tokens = self.llm.tokenize(prompt.encode('utf-8'), add_bos=False)
-        if tokens[-1] != self.eos_id:
-            tokens.append(self.eos_id)
-        n_tokens = len(tokens)
-        
-        if n_tokens > 512:
-            raise ValueError(f"Input too long: {n_tokens} tokens (max 512)")
+app = FastAPI(
+    title="AI Summarizer API",
+    description="Local AI Summarization API using T5 and llama.cpp",
+    version="1.1.0",
+    lifespan=lifespan
+)
 
-        # Manual encoder step for T5 architecture
-        batch = llama_cpp.llama_batch_init(n_tokens, 0, 1)
-        try:
-            batch.n_tokens = n_tokens
-            for i in range(n_tokens):
-                batch.token[i] = tokens[i]
-                batch.pos[i] = i
-                batch.n_seq_id[i] = 1
-                batch.seq_id[i][0] = 0
-                batch.logits[i] = 1 # Set all to 1 for encoder
-            
-            ret = llama_cpp.llama_encode(self.llm.ctx, batch)
-            if ret != 0:
-                return f"Error: llama_encode failed with code {ret}"
-        finally:
-            llama_cpp.llama_batch_free(batch)
-        
-        # Decoder start
-        decoder_token_id = self.pad_id
-        output_tokens = []
-        
-        for i in range(max_tokens):
-            token_arr = (llama_cpp.llama_token * 1)(decoder_token_id)
-            batch_d = llama_cpp.llama_batch_get_one(token_arr, 1, i, 0)
-            
-            ret = llama_cpp.llama_decode(self.llm.ctx, batch_d)
-            if ret != 0:
-                break
-            
-            logits_ptr = llama_cpp.llama_get_logits(self.llm.ctx)
-            n_vocab = self.llm.n_vocab()
-            logits = np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,))
-            
-            # Prevent EOS if under min_tokens
-            if len(output_tokens) < min_tokens:
-                logits[self.eos_id] = -1e10
-            
-            # Greedy sampling
-            next_token = int(np.argmax(logits))
-            
-            if next_token == self.eos_id:
-                break
-                
-            output_tokens.append(next_token)
-            decoder_token_id = next_token
-            
-        return self.llm.detokenize(output_tokens).decode('utf-8', errors='ignore').strip()
-
-# Initialize summarizer
-summarizer = Summarizer(MODEL_PATH)
-
+# Request/Response Models
 class SummaryRequest(BaseModel):
-    text: str
-    min_tokens: Optional[int] = 10
-    max_tokens: Optional[int] = 128
-    instructions: Optional[str] = None
+    text: str = Field(..., min_length=1, description="Text to be summarized")
+    instructions: Optional[str] = Field(None, description="Specific instructions for summarization")
+    min_tokens: int = Field(10, ge=1, le=512, description="Minimum tokens in the output")
+    max_tokens: int = Field(128, ge=1, le=512, description="Maximum tokens in the output")
+    temperature: float = Field(0.0, ge=0.0, le=2.0, description="Sampling temperature")
+
+    @validator("max_tokens")
+    def validate_tokens(cls, v, values):
+        if "min_tokens" in values and v < values["min_tokens"]:
+            raise ValueError("max_tokens must be greater than or equal to min_tokens")
+        return v
 
 class SummaryResponse(BaseModel):
     summary: str
-    tokens_used: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    processing_time_ms: int
 
-async def verify_secret_key(x_secret_key: str = Header(...)):
-    if x_secret_key != SECRET_KEY:
-        raise HTTPException(status_code=403, detail="Invalid Secret Key")
+# Security
+async def verify_secret_key(x_secret_key: str = Header(..., alias="X-Secret-Key")):
+    if x_secret_key != API_SECRET_KEY:
+        logger.warning(f"Unauthorized access attempt with key: {x_secret_key}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing Secret Key"
+        )
     return x_secret_key
 
 @app.post("/summarize", response_model=SummaryResponse)
-async def api_summarize(
-    request: SummaryRequest, 
+async def summarize_endpoint(
+    request: SummaryRequest,
     secret_key: str = Depends(verify_secret_key)
 ):
-    token_count = summarizer.get_token_count(request.text)
-    
-    if token_count > MAX_INPUT_TOKENS:
+    if summarizer is None:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Input text too long: {token_count} tokens. Limit is {MAX_INPUT_TOKENS}."
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model is not loaded"
         )
-    
+
     try:
-        summary = summarizer.summarize(
-            request.text, 
-            min_tokens=request.min_tokens, 
+        # Pre-validate token length
+        input_tokens = summarizer.tokenize(request.text)
+        if len(input_tokens) > MAX_CONTEXT_LENGTH - 50: # Leave some buffer
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Input text is too long ({len(input_tokens)} tokens). Max is {MAX_CONTEXT_LENGTH - 50}."
+            )
+
+        # Run inference in a thread pool to avoid blocking the async event loop
+        result = await run_in_threadpool(
+            summarizer.summarize,
+            text=request.text,
+            instructions=request.instructions,
+            min_tokens=request.min_tokens,
             max_tokens=request.max_tokens,
-            instructions=request.instructions
+            temperature=request.temperature
         )
-        return SummaryResponse(summary=summary, tokens_used=token_count)
+        
+        return SummaryResponse(**result)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Inference error occurred")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred during summarization"
+        )
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    if summarizer is None:
+        return {"status": "unhealthy", "reason": "model_not_loaded"}
+    return {"status": "healthy", "model": MODEL_PATH}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use environment variables for host/port or defaults
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", 8000))
+    uvicorn.run(app, host=host, port=port)

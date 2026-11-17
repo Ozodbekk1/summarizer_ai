@@ -1,99 +1,130 @@
 import llama_cpp
-import ctypes
 import numpy as np
+import time
+import logging
+from typing import List, Optional
 
-print("started")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def summarize_text(text, model_path="summarizer_ai_model.gguf", min_tokens=20, max_tokens=128, instructions=None):
-    print(f"Loading model: {model_path}...")
-    # Load model using the Llama class for convenience
-    llm = llama_cpp.Llama(model_path=model_path, n_ctx=512, verbose=False, embedding=True)
-    
-    # Clear KV cache to avoid state carry-over (if instance was reused)
-    mem = llama_cpp.llama_get_memory(llm.ctx)
-    if mem:
-        llama_cpp.llama_memory_clear(mem, True)
-    
-    # Build prompt with optional instructions
-    prompt = "summarize: "
-    if instructions:
-        prompt += instructions.strip() + " "
-    prompt += text
-    tokens = llm.tokenize(prompt.encode('utf-8'), add_bos=False)
-    if tokens[-1] != llm.token_eos():
-        tokens.append(llm.token_eos())
-    n_tokens = len(tokens)
-    
-    print(f"Encoding {n_tokens} tokens...")
-    # Manual encoder step for T5 architecture
-    batch = llama_cpp.llama_batch_init(n_tokens, 0, 1)
-    try:
-        batch.n_tokens = n_tokens
-        for i in range(n_tokens):
-            batch.token[i] = tokens[i]
-            batch.pos[i] = i
-            batch.n_seq_id[i] = 1
-            batch.seq_id[i][0] = 0
-            batch.logits[i] = True # For encoder, we need all outputs
+class Summarizer:
+    def __init__(self, model_path: str, n_ctx: int = 512):
+        self.model_path = model_path
+        self.n_ctx = n_ctx
+        # We load a temporary instance just to get some metadata
+        llm = llama_cpp.Llama(model_path=model_path, n_ctx=1, verbose=False)
+        self.eos_token_id = llm.token_eos()
+        self.bos_token_id = llm.token_bos()
+        self.vocab_size = llm.n_vocab()
+        del llm
+
+    def _sample(self, logits, temperature=0.7, top_p=0.9):
+        if temperature <= 0:
+            return int(np.argmax(logits))
         
-        ret = llama_cpp.llama_encode(llm.ctx, batch)
-        if ret != 0:
-            return f"Error: llama_encode failed with code {ret}"
-    finally:
-        llama_cpp.llama_batch_free(batch)
-    
-    print("Decoding...")
-    # Decoder start token for T5 is typically 0 (<pad>)
-    decoder_token_id = 0
-    output_tokens = []
-    
-    eos_id = llm.token_eos()
-    for i in range(max_tokens):
-        # Decode one token at a time
-        token_arr = (llama_cpp.llama_token * 1)(decoder_token_id)
-        batch_d = llama_cpp.llama_batch_get_one(token_arr, 1, i, 0)
+        logits = logits / temperature
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / np.sum(exp_logits)
         
-        ret = llama_cpp.llama_decode(llm.ctx, batch_d)
-        if ret != 0:
-            print(f"llama_decode failed with code {ret}")
-            break
+        sorted_indices = np.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+        cumulative_probs = np.cumsum(sorted_probs)
         
-        # Get logits and sample greedily
-        logits_ptr = llama_cpp.llama_get_logits(llm.ctx)
-        n_vocab = llm.n_vocab()
-        logits = np.ctypeslib.as_array(logits_ptr, shape=(n_vocab,))
+        indices_to_remove = cumulative_probs > top_p
+        indices_to_remove[1:] = indices_to_remove[:-1]
+        indices_to_remove[0] = False
         
-        # Prevent EOS if under min_tokens
-        if len(output_tokens) < min_tokens:
-            logits[eos_id] = -1e10
+        probs[sorted_indices[indices_to_remove]] = 0
+        probs = probs / (np.sum(probs) + 1e-10)
+        
+        return int(np.random.choice(len(probs), p=probs))
+
+    def summarize(
+        self, 
+        text: str, 
+        instructions: Optional[str] = None,
+        min_tokens: int = 10, 
+        max_tokens: int = 128,
+        temperature: float = 0.0
+    ):
+        start_time = time.time()
+        
+        # Load fresh instance for each request to ensure state isolation (T5 requirement)
+        # and thread safety. Given the small model size (60MB), this is fast (~60ms).
+        llm = llama_cpp.Llama(
+            model_path=self.model_path, 
+            n_ctx=self.n_ctx, 
+            verbose=False, 
+            embedding=True
+        )
+        
+        try:
+            prompt = "summarize: "
+            if instructions:
+                prompt += instructions.strip() + ": "
+            prompt += text.strip()
+
+            tokens = llm.tokenize(prompt.encode('utf-8'), add_bos=False)
+            if not tokens or tokens[-1] != self.eos_token_id:
+                tokens.append(self.eos_token_id)
             
-        # Greedy sampling
-        next_token = int(np.argmax(logits))
-        
-        if next_token == eos_id:
-            break
+            input_token_count = len(tokens)
             
-        output_tokens.append(next_token)
-        decoder_token_id = next_token
-        
-    return llm.detokenize(output_tokens).decode('utf-8', errors='ignore').strip()
+            # Encoder
+            n_tokens = len(tokens)
+            batch = llama_cpp.llama_batch_init(n_tokens, 0, 1)
+            try:
+                batch.n_tokens = n_tokens
+                for i in range(n_tokens):
+                    batch.token[i] = tokens[i]
+                    batch.pos[i] = i
+                    batch.n_seq_id[i] = 1
+                    batch.seq_id[i][0] = 0
+                    batch.logits[i] = True
+                
+                ret = llama_cpp.llama_encode(llm.ctx, batch)
+                if ret != 0:
+                    raise RuntimeError(f"Encoder failed: {ret}")
+            finally:
+                llama_cpp.llama_batch_free(batch)
 
-if __name__ == "__main__":
-    sample_text = """
-    The Artificial Intelligence (AI) field has seen significant advancements in recent years. 
-    Large Language Models (LLMs) have become particularly prominent, demonstrating 
-    remarkable capabilities in understanding and generating human-like text. 
-    These models are trained on vast amounts of data and can perform various tasks 
-    including translation, summarization, and creative writing. 
-    GGUF is a file format used for storing models for inference with GGML and 
-    llama.cpp-based executors. It is designed to be extensible and efficient.
-    """
-    
-    summary = summarize_text(
-        sample_text, 
-        min_tokens=30, 
-        instructions="Focus on the core concept and technical specifications."
-    )
-    print("\n--- Summary ---")
-    print(summary)
-    print("---------------")
+            # Decoder
+            output_tokens = []
+            curr_token_id = 0 # T5 decoder start token
+            for i in range(max_tokens):
+                t_arr = (llama_cpp.llama_token * 1)(curr_token_id)
+                b_d = llama_cpp.llama_batch_get_one(t_arr, 1, i, 0)
+                
+                ret = llama_cpp.llama_decode(llm.ctx, b_d)
+                if ret != 0: break
+                
+                logits_ptr = llama_cpp.llama_get_logits(llm.ctx)
+                logits = np.ctypeslib.as_array(logits_ptr, shape=(self.vocab_size,)).copy()
+                
+                if len(output_tokens) < min_tokens:
+                    logits[self.eos_token_id] = -1e10
+                
+                next_token = self._sample(logits, temperature=temperature)
+                if next_token == self.eos_token_id: break
+                
+                output_tokens.append(next_token)
+                curr_token_id = next_token
+                
+            summary_text = llm.detokenize(output_tokens).decode('utf-8', errors='ignore').strip()
+            
+            return {
+                "summary": summary_text,
+                "input_tokens": input_token_count,
+                "output_tokens": len(output_tokens),
+                "total_tokens": input_token_count + len(output_tokens),
+                "processing_time_ms": int((time.time() - start_time) * 1000)
+            }
+        finally:
+            # Llama instance is cleaned up when it goes out of scope or explicitly deleted
+            del llm
+
+    def tokenize(self, text: str) -> List[int]:
+        # Temporary instance for tokenization
+        llm = llama_cpp.Llama(model_path=self.model_path, n_ctx=1, verbose=False)
+        tokens = llm.tokenize(text.encode('utf-8'), add_bos=False)
+        return tokens
