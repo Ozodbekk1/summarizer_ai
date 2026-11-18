@@ -7,7 +7,7 @@ A robust FastAPI-based summarization service specializing in local inference wit
 - **T5 Architecture Support**: Correct manual encoder-decoder inference implementation for `llama.cpp`.
 - **State Isolation**: Automatic context management ensures fresh state for every request, fixing common inference errors in T5.
 - **Async API**: Non-blocking inference execution using FastAPI and `starlette.concurrency`.
-- **Security**: Environment-based API Secret Key authentication (`X-API-Key` header).
+- **Security**: Environment-based API Secret Key authentication (`X-Secret-Key` header).
 - **Validation**: Strict Pydantic validation for all requests and token limits.
 - **Detailed Metrics**: Accurate tracking of input/output tokens and processing time.
 - **Thread-Safe**: Safely handles concurrent requests.
@@ -29,6 +29,39 @@ A robust FastAPI-based summarization service specializing in local inference wit
 3. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
+   ```
+
+## 🐳 Docker Deployment
+
+### Using Docker Compose (Recommended)
+
+1. **Build and start the container**:
+   ```bash
+   docker-compose up --build -d
+   ```
+
+2. **Check the logs**:
+   ```bash
+   docker-compose logs -f
+   ```
+
+3. **Stop the service**:
+   ```bash
+   docker-compose down
+   ```
+
+### Using Docker CLI
+
+1. **Build the image**:
+   ```bash
+   docker build -t summarizer-ai .
+   ```
+
+2. **Run the container**:
+   ```bash
+   docker run -d -p 8000:8000 --name summarizer-ai-container \
+     -e API_SECRET_KEY=your_secure_key_here \
+     summarizer-ai
    ```
 
 ## ⚙️ Configuration
@@ -105,7 +138,7 @@ If your use case requires strict instruction following (e.g., "exactly 3 bullet 
 2. **Summarize Text**:
    - Method: `POST`
    - URL: `{{base_url}}/summarize`
-   - Headers: `X-API-Key: {{secret_key}}`
+   - Headers: `X-Secret-Key: {{secret_key}}`
    - Body (JSON):
      ```json
      {

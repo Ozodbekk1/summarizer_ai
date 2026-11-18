@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  summarizer-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_SECRET_KEY=${API_SECRET_KEY:-my_super_secret_key}
+      - MODEL_PATH=summarizer_ai_model.gguf
+    restart: always
+    volumes:
+      # Optional: mount model if you want to swap it without rebuilding
+      - ./summarizer_ai_model.gguf:/app/summarizer_ai_model.gguf
